@@ -28,10 +28,14 @@ Usage:
   python danp_llm_conciseness.py --n_train 4 --n_eval 4 --epochs 1 --batch_size 2 --max_length 256
 
   # Quick DANP testing with tiny models:
-  python danp_llm_conciseness.py --tiny_model trl --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
-  python danp_llm_conciseness.py --tiny_model tiny_gpt2 --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
-  python danp_llm_conciseness.py --tiny_model gpt2 --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
-  python danp_llm_conciseness.py --tiny_model tiny_llama --n_train 4 --n_eval 2 --epochs 2 --batch_size 2
+  python3 danp_llm_conciseness.py --tiny_model trl --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
+  python3 danp_llm_conciseness.py --tiny_model tiny_gpt2 --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
+  python3 danp_llm_conciseness.py --tiny_model gpt2 --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
+  python3 danp_llm_conciseness.py --tiny_model tiny_llama --n_train 4 --n_eval 2 --epochs 2 --batch_size 2 --alpha 0
+
+  # Simpler tasks (good for tiny models):
+  python3 danp_llm_conciseness.py --tiny_model tiny_llama --task copy --n_train 8 --n_eval 4 --epochs 5
+  python3 danp_llm_conciseness.py --tiny_model tiny_llama --task constant --n_train 8 --n_eval 4 --epochs 10
 
   # If delta_L≈0 (no learning): try larger sigma (e.g. --sigma 1e-2) so noise affects loss
   # If NaN: use smaller eta/alpha, or --max_dec_update 0.001 to stabilize decorrelation
@@ -80,6 +84,8 @@ parser.add_argument('--max_update', type=float, default=1.0, help='Clip per-laye
 parser.add_argument('--max_dec_update', type=float, default=0.01, help='Clip decorrelation update to prevent R explosion/NaN')
 parser.add_argument('--tiny_model', type=str, default=None,
                     help='Quick-test preset: trl (~2M), tiny_gpt2 (~4M), gpt2 (~124M), tiny_llama (~2K). Overrides --model_name and --max_length.')
+parser.add_argument('--task', type=str, default='conciseness', choices=['copy', 'constant', 'conciseness'],
+                    help='Task: copy (echo input), constant (fixed completion), conciseness (summarize).')
 args = parser.parse_args()
 
 # Apply tiny_model preset
@@ -87,7 +93,7 @@ _TINY_PRESETS = {
     'trl': ('trl-internal-testing/tiny-LlamaForCausalLM-3', 128),
     'tiny_gpt2': ('sshleifer/tiny-gpt2', 128),
     'gpt2': ('gpt2', 256),
-    'tiny_llama': ('ccmodular/tiny-random-LlamaForCausalLM', 64),
+    'tiny_llama': ('ccmodular/tiny-random-LlamaForCausalLM', 32),
 }
 if args.tiny_model:
     if args.tiny_model not in _TINY_PRESETS:
@@ -309,8 +315,10 @@ class DANPFullHook:
         self._orig[name] = orig
 
 
-def _prepare_batch(batch, tokenizer, device, max_length, label_ignore_id=-100):
-    """Prepare input_ids, attention_mask, labels for a batch of (prompt, target) pairs."""
+def _prepare_batch(batch, tokenizer, device, max_length, label_ignore_id=-100, vocab_size=None):
+    """Prepare input_ids, attention_mask, labels for a batch of (prompt, target) pairs.
+    If vocab_size is provided, token IDs are clamped to [0, vocab_size-1] to avoid
+    embedding IndexError when tokenizer vocab exceeds model embedding size (e.g. tiny Llama)."""
     input_ids_list = []
     labels_list = []
     for p, t in batch:
@@ -329,16 +337,22 @@ def _prepare_batch(batch, tokenizer, device, max_length, label_ignore_id=-100):
     labels = torch.full((len(batch), max_len), label_ignore_id, dtype=torch.long, device=device)
     for i in range(len(batch)):
         L = len(input_ids_list[i])
-        input_ids[i, :L] = torch.tensor(input_ids_list[i], device=device)
+        inp = torch.tensor(input_ids_list[i], device=device)
+        lab = torch.tensor(labels_list[i], device=device)
+        if vocab_size is not None:
+            inp = inp.clamp(0, vocab_size - 1)
+            lab = torch.where(lab == label_ignore_id, lab, lab.clamp(0, vocab_size - 1))
+        input_ids[i, :L] = inp
         attention_mask[i, :L] = 1
-        labels[i, :L] = torch.tensor(labels_list[i], device=device)
+        labels[i, :L] = lab
     return input_ids, attention_mask, labels
 
 
 def compute_loss(model, tokenizer, batch, device, label_ignore_id=-100):
     """Teacher-forcing cross-entropy loss on target tokens only."""
     input_ids, attention_mask, labels = _prepare_batch(
-        batch, tokenizer, device, args.max_length, label_ignore_id
+        batch, tokenizer, device, args.max_length, label_ignore_id,
+        vocab_size=model.config.vocab_size,
     )
     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
     return outputs.loss
@@ -355,17 +369,18 @@ def compute_danp_grad_estimate_per_sample(
     """
     batch = [single_example]
     input_ids, attention_mask, labels = _prepare_batch(
-        batch, tokenizer, device, args.max_length, label_ignore_id=-100
+        batch, tokenizer, device, args.max_length, label_ignore_id=-100,
+        vocab_size=model.config.vocab_size,
     )
 
     # Pass 1: Clean forward (once)
     hook.attach(add_noise=False, capture=True)
     with torch.no_grad():
         logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        # Use float32 for loss to avoid bf16 overflow with tiny/random models
+        logits_f = logits.float().view(-1, model.config.vocab_size)
         L_clean = F.cross_entropy(
-            logits.view(-1, model.config.vocab_size),
-            labels.view(-1),
-            ignore_index=-100,
+            logits_f, labels.view(-1), ignore_index=-100,
         ).item()
     captured_clean = {k: (v[0].clone(), v[1].clone(), None) for k, v in hook._captured.items()}
     hook.detach()
@@ -378,10 +393,9 @@ def compute_danp_grad_estimate_per_sample(
         hook.attach(add_noise=True, capture=True, pop_offset=pop_idx)
         with torch.no_grad():
             logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            logits_f = logits.float().view(-1, model.config.vocab_size)
             L_noisy = F.cross_entropy(
-                logits.view(-1, model.config.vocab_size),
-                labels.view(-1),
-                ignore_index=-100,
+                logits_f, labels.view(-1), ignore_index=-100,
             ).item()
         captured_noisy = hook._captured.copy()
         hook.detach()
@@ -555,6 +569,38 @@ def run_danp_batch_step(model, tokenizer, batch, device, hook, eta, alpha,
     return total_loss / batch_size, total_delta_L / batch_size
 
 
+def load_task_data(n_train, n_eval):
+    """Load (train_data, eval_data) based on --task. Each item is (prompt, target)."""
+    if args.task == 'copy':
+        return _copy_task_data(n_train, n_eval)
+    if args.task == 'constant':
+        return _constant_task_data(n_train, n_eval)
+    return load_conciseness_dataset(n_train, n_eval)
+
+
+def _copy_task_data(n_train, n_eval):
+    """Copy/echo task: Repeat the input. Short targets, easy for tiny models."""
+    examples = [
+        "hello", "world", "yes", "no", "cat", "dog", "run", "go",
+        "one two", "a b c", "foo bar", "test", "ok", "hi", "bye",
+        "red blue", "up down", "big small", "fast slow", "hot cold",
+    ]
+    n_total = n_train + n_eval
+    expanded = (examples * ((n_total // len(examples)) + 1))[:n_total]
+    train = [(f"Repeat: {e}", f" {e}") for e in expanded[:n_train]]
+    eval_ = [(f"Repeat: {e}", f" {e}") for e in expanded[n_train:n_train + n_eval]]
+    return train, eval_
+
+
+def _constant_task_data(n_train, n_eval):
+    """Constant completion: same prompt, same single-token target. Easiest task."""
+    prompt = "The answer is:"
+    target = " 4"  # single token (space + digit)
+    train = [(prompt, target)] * n_train
+    eval_ = [(prompt, target)] * n_eval
+    return train, eval_
+
+
 def load_conciseness_dataset(n_train, n_eval):
     """Load conciseness/summarization dataset. Uses xsum for short summaries."""
     cache_dir = os.path.join(os.path.dirname(__file__), ".cache", "hf_datasets")
@@ -619,8 +665,8 @@ def main():
         os.makedirs(hf_cache, exist_ok=True)
         os.environ["HF_HOME"] = hf_cache
 
-    print("Loading conciseness dataset...")
-    train_data, eval_data = load_conciseness_dataset(args.n_train, args.n_eval)
+    print(f"Loading {args.task} dataset...")
+    train_data, eval_data = load_task_data(args.n_train, args.n_eval)
     print(f"Train: {len(train_data)}, Eval: {len(eval_data)}")
 
     hf_cache = args.hf_cache_dir or os.path.join(os.path.dirname(__file__), ".cache", "huggingface")
