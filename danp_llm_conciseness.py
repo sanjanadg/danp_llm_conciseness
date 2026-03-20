@@ -11,17 +11,24 @@ Usage:
   python danp_llm_conciseness.py --n_train 32 --n_eval 50 --epochs 5 --batch_size 2
   python danp_llm_conciseness.py --model_name Qwen/Qwen2.5-0.5B-Instruct --output_dir ./out_danp_full
 
+
+  # Standard run
+  # python3 danp_llm_conciseness.py --n_train 32 --n_eval 50 --epochs 10 --batch_size 8 --verbose --eta 1e-3 --sigma 1e-3 --alpha 1e-4
+
   # Minimal run
   python danp_llm_conciseness.py --n_train 4 --n_eval 4 --epochs 1 --batch_size 2
 
   # With verbose logging
-  python danp_llm_conciseness.py --n_train 4 --n_eval 4 --epochs 4 --batch_size 2 --verbose
+  python3 danp_llm_conciseness.py --n_train 4 --n_eval 10 --epochs 10 --batch_size 2 --verbose --eta 1e-7 --sigma 1e-2 --alpha 0
 
   # Population size 4 (more stable gradient estimate)
-  python danp_llm_conciseness.py --n_train 8 --n_eval 4 --epochs 2 --batch_size 2 --n_population 4
+  python3 danp_llm_conciseness.py --n_train 8 --n_eval 4 --epochs 10 --batch_size 2 --n_population 4 --eta 1e-7
 
   # Shorter sequences
   python danp_llm_conciseness.py --n_train 4 --n_eval 4 --epochs 1 --batch_size 2 --max_length 256
+
+  # If delta_L≈0 (no learning): try larger sigma (e.g. --sigma 1e-2) so noise affects loss
+  # If NaN: use smaller eta/alpha, or --max_dec_update 0.001 to stabilize decorrelation
 """
 
 import torch
@@ -64,6 +71,7 @@ parser.add_argument('--n_population', type=int, default=1,
                     help='Number of noisy forward passes per sample; average gradient estimate (reduces variance)')
 parser.add_argument('--max_scale', type=float, default=1e2, help='Clip scale factor to prevent explosion')
 parser.add_argument('--max_update', type=float, default=1.0, help='Clip per-layer weight update magnitude')
+parser.add_argument('--max_dec_update', type=float, default=0.01, help='Clip decorrelation update to prevent R explosion/NaN')
 args = parser.parse_args()
 
 
@@ -173,15 +181,17 @@ class DANPFullHook:
         self._add_noise = True
         self._capture = False
         self._captured = {}
+        self._pop_offset = 0
 
     def _seed_for_call(self, layer_uid: int, row_start: int) -> int:
-        x = (self.base_seed ^ layer_uid) + 0x9e3779b9 + (row_start * 2654435761 & 0x7FFFFFFF)
+        x = (self.base_seed ^ layer_uid) + 0x9e3779b9 + (row_start * 2654435761 & 0x7FFFFFFF) + (self._pop_offset * 1000000)
         return x & 0x7FFFFFFF
 
-    def attach(self, add_noise: bool = True, capture: bool = False):
+    def attach(self, add_noise: bool = True, capture: bool = False, pop_offset: int = 0):
         self._add_noise = add_noise
         self._capture = capture
         self._captured = {}
+        self._pop_offset = pop_offset
         for name in self._row_counters:
             self._row_counters[name] = 0
         for name, mod in self._targets:
@@ -290,7 +300,7 @@ def compute_loss(model, tokenizer, batch, device, label_ignore_id=-100):
 
 def compute_danp_grad_estimate_per_sample(
     model, tokenizer, single_example, device, hook: DANPFullHook, eta, alpha,
-    n_population=1, verbose=False, max_scale=1e2, max_update=1.0,
+    n_population=1, verbose=False, max_scale=1e2, max_update=1.0, max_dec_update=0.01,
 ):
     """
     Compute gradient estimate and decorrelation updates for a single sample.
@@ -319,7 +329,7 @@ def compute_danp_grad_estimate_per_sample(
     delta_L_sum = 0.0
     last_scale_raw, last_norm_sq, last_N = 0.0, 0.0, 0
     for pop_idx in range(n_population):
-        hook.attach(add_noise=True, capture=True)
+        hook.attach(add_noise=True, capture=True, pop_offset=pop_idx)
         with torch.no_grad():
             logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
             L_noisy = F.cross_entropy(
@@ -349,7 +359,9 @@ def compute_danp_grad_estimate_per_sample(
         N = delta_a_concat.numel()
 
         delta_L = L_noisy - L_clean
-        delta_L_clamped = np.clip(delta_L, -1e4, 1e4) # should clamp here?
+        delta_L_clamped = np.clip(float(delta_L), -1e4, 1e4)
+        if not np.isfinite(delta_L_clamped):
+            delta_L_clamped = 0.0
         scale_raw = eta * N * delta_L_clamped / norm_sq
         scale = np.clip(scale_raw, -max_scale, max_scale)
         last_scale_raw, last_norm_sq, last_N = scale_raw, norm_sq, N
@@ -399,6 +411,7 @@ def compute_danp_grad_estimate_per_sample(
                 weight_updates[key] = acc_mean.to(mod.bias.dtype)
     
     # Decorrelation: R -= alpha * (cov - diag) @ R (uses clean activations only)
+    # Clip updates and guard against NaN to prevent R explosion in deep LLMs
     decorrelation_updates = {}
     for name, _ in hook._targets:
         if name not in captured_clean:
@@ -414,6 +427,9 @@ def compute_danp_grad_estimate_per_sample(
             cov = torch.outer(x_star_out.squeeze(0), x_star_out.squeeze(0))
         diag = torch.diag((x_star_out ** 2).mean(dim=0))
         dec_update = alpha * (cov - diag) @ R_out
+        dec_update = torch.clamp(dec_update, -max_dec_update, max_dec_update)
+        if not (torch.isfinite(dec_update).all()):
+            dec_update = torch.zeros_like(dec_update)
         decorrelation_updates[name] = dec_update
 
     if verbose:
@@ -433,7 +449,7 @@ def _print_grad_stats(weight_updates, decorrelation_updates, L_clean, delta_L, s
 
 
 def run_danp_batch_step(model, tokenizer, batch, device, hook, eta, alpha,
-                        n_population=1, verbose=False, max_scale=1e2, max_update=1.0):
+                        n_population=1, verbose=False, max_scale=1e2, max_update=1.0, max_dec_update=0.01):
     """
     One DANP batch step: per-sample gradient/R accumulation, then average and apply.
     Like train_danp_batch in sythentic_data.py.
@@ -449,7 +465,7 @@ def run_danp_batch_step(model, tokenizer, batch, device, hook, eta, alpha,
         weight_updates, decorrelation_updates, L_clean, delta_L = compute_danp_grad_estimate_per_sample(
             model, tokenizer, batch[i], device, hook, eta, alpha,
             n_population=n_population, verbose=verbose and i == 0,
-            max_scale=max_scale, max_update=max_update,
+            max_scale=max_scale, max_update=max_update, max_dec_update=max_dec_update,
         )
         total_loss += L_clean
         total_delta_L += delta_L
@@ -464,23 +480,31 @@ def run_danp_batch_step(model, tokenizer, batch, device, hook, eta, alpha,
                 accumulated_decorrelation_updates[name] = torch.zeros_like(upd)
             accumulated_decorrelation_updates[name] += upd
 
-    # Average and apply weight updates
+    # Average and apply weight updates (skip if NaN to prevent corruption)
     with torch.no_grad():
         for key, acc in accumulated_weight_updates.items():
+            upd = acc / batch_size
+            if not torch.isfinite(upd).all():
+                continue
             if key.endswith(".weight"):
                 mod_path = key[:-7]
                 mod = model.get_submodule(mod_path)
-                mod.weight.sub_(acc.to(mod.weight.dtype) / batch_size)
+                mod.weight.sub_(upd.to(mod.weight.dtype))
             elif key.endswith(".bias"):
                 mod_path = key[:-6]
                 mod = model.get_submodule(mod_path)
                 if mod.bias is not None:
-                    mod.bias.sub_(acc.to(mod.bias.dtype) / batch_size)
+                    mod.bias.sub_(upd.to(mod.bias.dtype))
 
-    # Apply averaged decorrelation updates
+    # Apply averaged decorrelation updates (with NaN guard)
     for name, acc in accumulated_decorrelation_updates.items():
         if acc is not None:
-            hook.R[name].sub_(acc / batch_size)
+            upd = acc / batch_size
+            if torch.isfinite(upd).all():
+                hook.R[name].sub_(upd)
+                if not torch.isfinite(hook.R[name]).all():
+                    hook.R[name].copy_(torch.eye(hook.R[name].shape[0], device=hook.R[name].device, dtype=hook.R[name].dtype))
+            # else: skip corrupted decorrelation update
 
     return total_loss / batch_size, total_delta_L / batch_size
 
@@ -602,13 +626,14 @@ def main():
             hook.base_seed = base_seed
 
             verbose_this_step = args.verbose and step == 0
-            L_clean, delta_L = run_danp_batch_step(
+            L_clean, delta_L =             run_danp_batch_step(
                 model, tokenizer, batch, device, hook,
                 eta=args.eta, alpha=args.alpha,
                 n_population=args.n_population,
                 verbose=verbose_this_step,
                 max_scale=args.max_scale,
                 max_update=args.max_update,
+                max_dec_update=args.max_dec_update,
             )
             epoch_losses.append(L_clean)
             pbar.set_postfix({"loss": f"{L_clean:.4f}", "delta_L": f"{delta_L:.4f}"})
