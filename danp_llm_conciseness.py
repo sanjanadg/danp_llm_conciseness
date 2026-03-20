@@ -27,6 +27,12 @@ Usage:
   # Shorter sequences
   python danp_llm_conciseness.py --n_train 4 --n_eval 4 --epochs 1 --batch_size 2 --max_length 256
 
+  # Quick DANP testing with tiny models:
+  python danp_llm_conciseness.py --tiny_model trl --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
+  python danp_llm_conciseness.py --tiny_model tiny_gpt2 --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
+  python danp_llm_conciseness.py --tiny_model gpt2 --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
+  python danp_llm_conciseness.py --tiny_model tiny_llama --n_train 4 --n_eval 2 --epochs 2 --batch_size 2
+
   # If delta_L≈0 (no learning): try larger sigma (e.g. --sigma 1e-2) so noise affects loss
   # If NaN: use smaller eta/alpha, or --max_dec_update 0.001 to stabilize decorrelation
 """
@@ -72,7 +78,38 @@ parser.add_argument('--n_population', type=int, default=1,
 parser.add_argument('--max_scale', type=float, default=1e2, help='Clip scale factor to prevent explosion')
 parser.add_argument('--max_update', type=float, default=1.0, help='Clip per-layer weight update magnitude')
 parser.add_argument('--max_dec_update', type=float, default=0.01, help='Clip decorrelation update to prevent R explosion/NaN')
+parser.add_argument('--tiny_model', type=str, default=None,
+                    help='Quick-test preset: trl (~2M), tiny_gpt2 (~4M), gpt2 (~124M), tiny_llama (~2K). Overrides --model_name and --max_length.')
 args = parser.parse_args()
+
+# Apply tiny_model preset
+_TINY_PRESETS = {
+    'trl': ('trl-internal-testing/tiny-LlamaForCausalLM-3', 128),
+    'tiny_gpt2': ('sshleifer/tiny-gpt2', 128),
+    'gpt2': ('gpt2', 256),
+    'tiny_llama': ('ccmodular/tiny-random-LlamaForCausalLM', 64),
+}
+if args.tiny_model:
+    if args.tiny_model not in _TINY_PRESETS:
+        raise ValueError(f"--tiny_model must be one of {list(_TINY_PRESETS.keys())}, got {args.tiny_model!r}")
+    args.model_name, args.max_length = _TINY_PRESETS[args.tiny_model]
+
+
+# Architecture patterns: (regex for layer index, layer block name for last_k)
+_ARCH_PATTERNS = [
+    (r'\.layers\.(\d+)\.', 'layers'),   # Llama, Qwen, TinyLlama
+    (r'\.h\.(\d+)\.', 'h'),              # GPT-2, distilgpt2
+]
+
+
+def _detect_layer_pattern(model):
+    """Detect which architecture pattern the model uses. Returns (regex_str, total_blocks)."""
+    for pattern, block_name in _ARCH_PATTERNS:
+        names = [n for n, _ in model.named_modules() if re.search(pattern, n)]
+        if names:
+            idxs = [int(re.search(pattern, n).group(1)) for n in names]
+            return pattern, max(idxs) + 1
+    return None, 0
 
 
 def _stable_uid(s: str) -> int:
@@ -81,11 +118,14 @@ def _stable_uid(s: str) -> int:
 
 
 def _infer_total_blocks(model) -> int:
-    names = [n for n, _ in model.named_modules() if re.search(r'\.layers\.(\d+)\.', n)]
-    if not names:
-        return 0
-    idxs = [int(re.search(r'\.layers\.(\d+)\.', n).group(1)) for n in names]
-    return max(idxs) + 1
+    _, total = _detect_layer_pattern(model)
+    return total
+
+
+def _get_layer_index(name: str, pattern: str):
+    """Extract layer index from module name, or None if no match."""
+    m = re.search(pattern, name)
+    return int(m.group(1)) if m else None
 
 
 def _is_target_linear(include: str, name: str, mod, last_k: int, total_blocks: int) -> bool:
@@ -93,15 +133,18 @@ def _is_target_linear(include: str, name: str, mod, last_k: int, total_blocks: i
         return False
     lname = name.lower()
     if last_k > 0 and total_blocks > 0:
-        m = re.search(r'\.layers\.(\d+)\.', name)
-        if m and int(m.group(1)) < total_blocks - last_k:
-            return False
+        for pattern, _ in _ARCH_PATTERNS:
+            idx = _get_layer_index(name, pattern)
+            if idx is not None:
+                if idx < total_blocks - last_k:
+                    return False
+                break
     if include == 'head':
-        return lname.endswith('lm_head')
+        return lname.endswith('lm_head') or 'lm_head' in lname
     if include == 'attn':
-        return any(k in lname for k in ('attn', 'attention', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'in_proj'))
+        return any(k in lname for k in ('attn', 'attention', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'in_proj', 'c_attn'))
     if include == 'mlp':
-        return any(k in lname for k in ('mlp', 'ffn', 'gate_proj', 'up_proj', 'down_proj', 'fc1', 'fc2'))
+        return any(k in lname for k in ('mlp', 'ffn', 'gate_proj', 'up_proj', 'down_proj', 'fc1', 'fc2', 'c_fc', 'c_proj'))
     return True
 
 
@@ -120,17 +163,20 @@ def _get_R_in_producer(name, in_features, targets_by_name):
     For a Linear with given name and in_features, return the name of the layer whose
     R_out should be used as R_in (i.e. the layer that produces this input).
     Returns None if input comes from outside our hooked set.
-    Qwen2 MLP: gate_proj and up_proj receive same 896-dim input (from o_proj/residual).
-    down_proj receives 4864-dim from gate*up.
+
+    Llama/Qwen MLP: gate_proj and up_proj receive from o_proj. down_proj receives from gate*up.
+    GPT-2 MLP: c_fc receives from residual. c_proj receives from c_fc (after GELU).
     """
     if "down_proj" in name:
-        # down_proj receives from gate_proj output (or up_proj, same dim)
         producer = name.replace("down_proj", "gate_proj")
         if producer in targets_by_name and targets_by_name[producer].out_features == in_features:
             return producer
     elif "gate_proj" in name or "up_proj" in name:
-        # gate_proj and up_proj receive from o_proj (896) - may not be in our targets
         producer = name.replace("mlp.gate_proj", "self_attn.o_proj").replace("mlp.up_proj", "self_attn.o_proj")
+        if producer in targets_by_name and targets_by_name[producer].out_features == in_features:
+            return producer
+    elif "c_proj" in name:
+        producer = name.replace("c_proj", "c_fc")
         if producer in targets_by_name and targets_by_name[producer].out_features == in_features:
             return producer
     return None
@@ -577,13 +623,15 @@ def main():
     train_data, eval_data = load_conciseness_dataset(args.n_train, args.n_eval)
     print(f"Train: {len(train_data)}, Eval: {len(eval_data)}")
 
+    hf_cache = args.hf_cache_dir or os.path.join(os.path.dirname(__file__), ".cache", "huggingface")
+    os.makedirs(hf_cache, exist_ok=True)
     print(f"Loading model {args.model_name}...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
-        cache_dir=args.hf_cache_dir,
+        cache_dir=hf_cache,
         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=args.hf_cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=hf_cache)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
