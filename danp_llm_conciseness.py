@@ -15,8 +15,6 @@ Usage:
   # Standard run
   # python3 danp_llm_conciseness.py --n_train 32 --n_eval 50 --epochs 10 --batch_size 8 --verbose --eta 1e-3 --sigma 1e-3 --alpha 1e-4
 
-  # Minimal run
-  python danp_llm_conciseness.py --n_train 4 --n_eval 4 --epochs 1 --batch_size 2
 
   # With verbose logging
   python3 danp_llm_conciseness.py --n_train 4 --n_eval 10 --epochs 10 --batch_size 2 --verbose --eta 1e-7 --sigma 1e-2 --alpha 0
@@ -27,10 +25,19 @@ Usage:
   # Shorter sequences
   python danp_llm_conciseness.py --n_train 4 --n_eval 4 --epochs 1 --batch_size 2 --max_length 256
 
+  # Copy task (echo input) – good for tiny models
+  python3 danp_llm_conciseness.py --tiny_model trl --task copy --n_train 100 --n_eval 4 --epochs 5
+
+  # Constant task (single-token target) – simplest
+  python3 danp_llm_conciseness.py --tiny_model tiny_llama --task constant --n_train 8 --n_eval 4 --epochs 10
+
+  # Conciseness (default)
+  python3 danp_llm_conciseness.py --tiny_model tiny_llama --n_train 4 --n_eval 2 --epochs 2 --batch_size 2 --alpha 0
+
   # Quick DANP testing with tiny models:
-  python3 danp_llm_conciseness.py --tiny_model trl --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
-  python3 danp_llm_conciseness.py --tiny_model tiny_gpt2 --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
-  python3 danp_llm_conciseness.py --tiny_model gpt2 --n_train 8 --n_eval 4 --epochs 3 --batch_size 2
+  python3 danp_llm_conciseness.py --tiny_model trl --n_train 50 --n_eval 50 --epochs 3 --batch_size 4
+  python3 danp_llm_conciseness.py --tiny_model tiny_gpt2 --n_train 50 --n_eval 50 --epochs 30 --batch_size 4 --verbose --eta 1e-8 --sigma 1e-2 --alpha 0 
+  python3 danp_llm_conciseness.py --tiny_model gpt2 --n_train 50 --n_eval 50 --epochs 30 --batch_size 4 --verbose --eta 1e-8 --sigma 1e-2 --alpha 0 
   python3 danp_llm_conciseness.py --tiny_model tiny_llama --n_train 4 --n_eval 2 --epochs 2 --batch_size 2 --alpha 0
 
   # Simpler tasks (good for tiny models):
@@ -53,11 +60,20 @@ import hashlib
 from datasets import load_dataset
 from tqdm import tqdm
 
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
+    plt = None
+
 logging.set_verbosity_error()
 torch.backends.cuda.matmul.allow_tf32 = True
 
-ETA = 1e-3
-SIGMA = 1e-3
+ETA = 1e-5
+SIGMA = 1e-2
 ALPHA = 1e-4
 
 parser = argparse.ArgumentParser()
@@ -86,19 +102,25 @@ parser.add_argument('--tiny_model', type=str, default=None,
                     help='Quick-test preset: trl (~2M), tiny_gpt2 (~4M), gpt2 (~124M), tiny_llama (~2K). Overrides --model_name and --max_length.')
 parser.add_argument('--task', type=str, default='conciseness', choices=['copy', 'constant', 'conciseness'],
                     help='Task: copy (echo input), constant (fixed completion), conciseness (summarize).')
+parser.add_argument('--no_plot', action='store_true', help='Disable saving loss plot')
+parser.add_argument('--stable', action='store_true',
+                    help='Use stable preset: tiny_gpt2 + copy task + max_length 64 (avoids NaN)')
 args = parser.parse_args()
 
 # Apply tiny_model preset
 _TINY_PRESETS = {
     'trl': ('trl-internal-testing/tiny-LlamaForCausalLM-3', 128),
     'tiny_gpt2': ('sshleifer/tiny-gpt2', 128),
-    'gpt2': ('gpt2', 256),
+    'gpt2': ('gpt2', 64),
     'tiny_llama': ('ccmodular/tiny-random-LlamaForCausalLM', 32),
 }
 if args.tiny_model:
     if args.tiny_model not in _TINY_PRESETS:
         raise ValueError(f"--tiny_model must be one of {list(_TINY_PRESETS.keys())}, got {args.tiny_model!r}")
     args.model_name, args.max_length = _TINY_PRESETS[args.tiny_model]
+if args.stable:
+    args.model_name, args.max_length = _TINY_PRESETS['tiny_gpt2']
+    args.task = 'copy'
 
 
 # Architecture patterns: (regex for layer index, layer block name for last_k)
@@ -106,7 +128,6 @@ _ARCH_PATTERNS = [
     (r'\.layers\.(\d+)\.', 'layers'),   # Llama, Qwen, TinyLlama
     (r'\.h\.(\d+)\.', 'h'),              # GPT-2, distilgpt2
 ]
-
 
 def _detect_layer_pattern(model):
     """Detect which architecture pattern the model uses. Returns (regex_str, total_blocks)."""
@@ -349,13 +370,18 @@ def _prepare_batch(batch, tokenizer, device, max_length, label_ignore_id=-100, v
 
 
 def compute_loss(model, tokenizer, batch, device, label_ignore_id=-100):
-    """Teacher-forcing cross-entropy loss on target tokens only."""
+    """Teacher-forcing cross-entropy loss on target tokens only. Uses float32 + logits clamp to avoid overflow/NaN."""
     input_ids, attention_mask, labels = _prepare_batch(
         batch, tokenizer, device, args.max_length, label_ignore_id,
         vocab_size=model.config.vocab_size,
     )
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-    return outputs.loss
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        logits_f = logits.float().view(-1, model.config.vocab_size).clamp(-50.0, 50.0)
+        loss = F.cross_entropy(
+            logits_f, labels.view(-1), ignore_index=label_ignore_id,
+        )
+    return loss
 
 
 def compute_danp_grad_estimate_per_sample(
@@ -377,11 +403,13 @@ def compute_danp_grad_estimate_per_sample(
     hook.attach(add_noise=False, capture=True)
     with torch.no_grad():
         logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        # Use float32 for loss to avoid bf16 overflow with tiny/random models
-        logits_f = logits.float().view(-1, model.config.vocab_size)
+        logits_f = logits.float().view(-1, model.config.vocab_size).clamp(-50.0, 50.0)
         L_clean = F.cross_entropy(
             logits_f, labels.view(-1), ignore_index=-100,
         ).item()
+    if not np.isfinite(L_clean):
+        hook.detach()
+        return {}, {}, float('nan'), 0.0  # Skip corrupted sample
     captured_clean = {k: (v[0].clone(), v[1].clone(), None) for k, v in hook._captured.items()}
     hook.detach()
 
@@ -393,7 +421,7 @@ def compute_danp_grad_estimate_per_sample(
         hook.attach(add_noise=True, capture=True, pop_offset=pop_idx)
         with torch.no_grad():
             logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-            logits_f = logits.float().view(-1, model.config.vocab_size)
+            logits_f = logits.float().view(-1, model.config.vocab_size).clamp(-50.0, 50.0)
             L_noisy = F.cross_entropy(
                 logits_f, labels.view(-1), ignore_index=-100,
             ).item()
@@ -417,6 +445,8 @@ def compute_danp_grad_estimate_per_sample(
         delta_a_concat = torch.cat(delta_a_all)
         norm_sq = (delta_a_concat ** 2).sum().item() + 1e-8
         N = delta_a_concat.numel()
+        if not np.isfinite(norm_sq):
+            continue  # Skip population member with NaN activations
 
         delta_L = L_noisy - L_clean
         delta_L_clamped = np.clip(float(delta_L), -1e4, 1e4)
@@ -439,6 +469,8 @@ def compute_danp_grad_estimate_per_sample(
             if delta_a.dim() > 2:
                 delta_a = delta_a.reshape(-1, delta_a.shape[-1])
             grad = delta_a.T @ x_star
+            if not torch.isfinite(grad).all():
+                continue
             update = scale * grad
             update = torch.clamp(update, -max_update, max_update)
             key_w = name + ".weight"
@@ -693,7 +725,7 @@ def main():
             batch = eval_data[i:i + args.batch_size]
             loss = compute_loss(model, tokenizer, batch, device).item()
             eval_losses.append(loss)
-    baseline_eval = np.mean(eval_losses)
+    baseline_eval = np.nanmean(eval_losses)
     print(f"[BASELINE] Eval loss: {baseline_eval:.4f}")
 
     train_losses = []
@@ -732,7 +764,7 @@ def main():
             epoch_losses.append(L_clean)
             pbar.set_postfix({"loss": f"{L_clean:.4f}", "delta_L": f"{delta_L:.4f}"})
 
-        train_loss = np.mean(epoch_losses)
+        train_loss = np.nanmean(epoch_losses)
         train_losses.append(train_loss)
 
         if (epoch + 1) % args.eval_interval == 0:
@@ -743,7 +775,7 @@ def main():
                     batch = eval_data[i:i + args.batch_size]
                     loss = compute_loss(model, tokenizer, batch, device).item()
                     evals.append(loss)
-            eval_loss = np.mean(evals)
+            eval_loss = np.nanmean(evals)
             eval_losses_hist.append(eval_loss)
             print(f"[Epoch {epoch+1}] Train loss: {train_loss:.4f}, Eval loss: {eval_loss:.4f}")
 
@@ -755,7 +787,33 @@ def main():
     print(f"Saving model to {save_dir}...")
     model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
+
+    if _HAS_MATPLOTLIB and not args.no_plot and train_losses:
+        _plot_losses(train_losses, eval_losses_hist, args.eval_interval, args.output_dir, "conciseness")
+    elif not args.no_plot and train_losses and not _HAS_MATPLOTLIB:
+        print("Tip: Install matplotlib (pip install matplotlib) to save loss plots.")
+
     print("Done.")
+
+
+def _plot_losses(train_losses, eval_losses_hist, eval_interval, output_dir, experiment_name):
+    """Save train/eval loss plot to output_dir."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    epochs = list(range(1, len(train_losses) + 1))
+    ax.plot(epochs, train_losses, 'b-o', markersize=4, label='Train loss')
+    if eval_losses_hist:
+        eval_epochs = [eval_interval * (i + 1) for i in range(len(eval_losses_hist))]
+        ax.plot(eval_epochs, eval_losses_hist, 'r-s', markersize=4, label='Eval loss')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title(f'DANP {experiment_name} - Train & Eval Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    plot_path = os.path.join(output_dir, 'loss_plot.png')
+    fig.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"Saved loss plot to {plot_path}")
 
 
 if __name__ == "__main__":
