@@ -122,8 +122,9 @@ class DANPFullHook:
         self._row_counters = {n: 0 for n, _ in self._targets}
         self.R, self._R_in = {}, {}
         targets_by_name = dict(self._targets)
+        # Keep R on CPU to avoid OOM on large models; move to device lazily in forward
         for name, mod in self._targets:
-            R_out = torch.eye(mod.out_features, dtype=torch.float32, device=mod.weight.device)
+            R_out = torch.eye(mod.out_features, dtype=torch.float32, device=torch.device('cpu'))
             self.R[name] = R_out
             producer = _get_R_in_producer(name, mod.in_features, targets_by_name)
             self._R_in[name] = self.R[producer] if producer else None
@@ -152,8 +153,10 @@ class DANPFullHook:
         layer_uid = self._layer_uids[name]
 
         def fwd(x):
+            dev = x.device
             x2 = x.float().reshape(-1, x.shape[-1]) if x.dim() > 2 else x.float()
-            x_star = x2 @ R_in.T.to(x2.dtype) if R_in is not None else x2
+            R_in_dev = self._R_in[name].to(dev).to(x2.dtype) if self._R_in[name] is not None else None
+            x_star = x2 @ R_in_dev.T if R_in_dev is not None else x2
             with torch.no_grad():
                 y = orig(x_star.to(mod.weight.dtype)).float()
                 g = torch.Generator(device=y.device)
@@ -164,7 +167,8 @@ class DANPFullHook:
                     self._captured[name] = (x_star.detach().clone(), y.detach().clone(),
                                           y_noisy.detach().clone() if self._add_noise else None)
                 self._row_counters[name] += x2.shape[0]
-                out = (y_noisy @ R_out.T.to(y_noisy.dtype)).to(mod.weight.dtype)
+                R_out_dev = self.R[name].to(dev).to(y_noisy.dtype)
+                out = (y_noisy @ R_out_dev.T).to(mod.weight.dtype)
             if x.dim() > 2:
                 out = out.reshape(*x.shape[:-1], out.shape[-1])
             return out
@@ -266,7 +270,7 @@ def compute_danp_grad_per_sample(model, tokenizer, example, device, hook, eta, a
         if name not in captured_clean:
             continue
         _, y_clean, _ = captured_clean[name]
-        R_out = hook.R[name]
+        R_out = hook.R[name].to(y_clean.device)
         x_star_out = (y_clean @ R_out.T).reshape(-1, R_out.shape[0])
         cov = x_star_out.T @ x_star_out / max(x_star_out.shape[0], 1)
         diag = torch.diag((x_star_out ** 2).mean(dim=0))
@@ -302,11 +306,11 @@ def run_danp_batch_step(model, tokenizer, batch, device, hook, eta, alpha, n_pop
             mod.weight.sub_(upd.to(mod.weight.dtype))
         for n, acc in acc_decorr.items():
             if acc is not None:
-                upd = acc / batch_size
+                upd = (acc / batch_size).cpu()
                 if torch.isfinite(upd).all():
                     hook.R[n].sub_(upd)
                     if not torch.isfinite(hook.R[n]).all():
-                        hook.R[n].copy_(torch.eye(hook.R[n].shape[0], device=hook.R[n].device, dtype=hook.R[n].dtype))
+                        hook.R[n].copy_(torch.eye(hook.R[n].shape[0], device=torch.device('cpu'), dtype=hook.R[n].dtype))
     return total_loss / batch_size, total_delta / batch_size
 
 
@@ -492,8 +496,7 @@ def main():
             model = model_list[0]
             model.train()
             hook = DANPFullHook(model, args.np_include, 0, args.sigma, args.alpha, initial_seed + iteration)
-            for name in hook.R:
-                hook.R[name] = hook.R[name].to(accelerator.device)
+            # R matrices stay on CPU; moved to device lazily in forward to avoid OOM
 
             batch = list(dataset)
             L_clean, delta_L = run_danp_batch_step(
