@@ -161,7 +161,7 @@ class DANPFullHook:
                 y = orig(x_star.to(mod.weight.dtype)).float()
                 g = torch.Generator(device=y.device)
                 g.manual_seed(self._seed_for_call(layer_uid, self._row_counters[name]))
-                xi = torch.randn_like(y, generator=g) * self.sigma
+                xi = torch.randn(y.shape, generator=g, device=y.device, dtype=y.dtype) * self.sigma
                 y_noisy = y + xi if self._add_noise else y
                 if self._capture:
                     self._captured[name] = (x_star.detach().clone(), y.detach().clone(),
